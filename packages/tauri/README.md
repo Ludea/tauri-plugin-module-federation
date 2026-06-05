@@ -32,6 +32,7 @@ export default {
 ## Behavior
 
 - Hooks `afterResolve` and rewrites `remoteInfo.entry`.
+- Uses Tauri's `http://module-federation.localhost/...` custom-protocol URL shape on Windows and Android.
 - Registers a global runtime plugin during `beforeInit`.
 - Delegates fetching/caching to `tauri-plugin-module-federation`.
 

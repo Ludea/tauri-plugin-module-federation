@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Mutex};
 
 use sha::utils::{Digest, DigestExt};
 use tauri::{
-    http::uri,
+    http::{uri, Uri},
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
 };
@@ -39,6 +39,90 @@ impl<R: Runtime, T: Manager<R>> crate::TauriPluginModuleFederationExt<R> for T {
 #[derive(Default)]
 struct Schemes(pub Mutex<HashMap<(String, Option<u16>), String>>);
 
+fn remote_key(url: &Url) -> (String, Option<u16>) {
+    (url.host().unwrap().to_string(), url.port())
+}
+
+fn authority_from_host_port(host: &str, port: Option<u16>) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+
+    match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+fn windows_remote_path(uri: &Uri) -> Option<(String, Option<u16>, String)> {
+    if uri.host() != Some("module-federation.localhost") {
+        return None;
+    }
+
+    let path = uri.path().strip_prefix('/')?;
+    let (authority, remote_path) = path.split_once('/').unwrap_or((path, ""));
+
+    if authority.is_empty() {
+        return None;
+    }
+
+    let remote_authority = Url::parse(&format!("http://{authority}/")).ok()?;
+    let host = remote_authority.host_str()?.to_string();
+    let port = remote_authority.port();
+    let mut path_and_query = format!("/{remote_path}");
+
+    if let Some(query) = uri.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+
+    Some((host, port, path_and_query))
+}
+
+fn resolve_remote_url(uri: &Uri, schemes: &Schemes) -> Url {
+    uri.query()
+        .and_then(|query| {
+            let query_pairs: HashMap<_, _> = form_urlencoded::parse(query.as_bytes()).collect();
+
+            query_pairs.get("fullUrl").map(|v| {
+                let url = Url::parse(v).unwrap();
+                let mut schemes = schemes.0.lock().unwrap();
+
+                schemes
+                    .entry(remote_key(&url))
+                    .or_insert(url.scheme().to_string());
+
+                url
+            })
+        })
+        .unwrap_or_else(|| {
+            let (host, port, path_and_query) = windows_remote_path(uri).unwrap_or_else(|| {
+                (
+                    uri.host().unwrap().to_string(),
+                    uri.port().map(|p| p.as_u16()),
+                    uri.path_and_query()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_else(|| "/".to_string()),
+                )
+            });
+
+            let schemes = schemes.0.lock().unwrap();
+            let scheme = schemes.get(&(host.clone(), port)).unwrap_or_else(|| {
+                dbg!(&schemes);
+                panic!("Unknown scheme for host '{host}:{port:?}'")
+            });
+
+            let builder = uri::Builder::new()
+                .scheme(scheme.as_str())
+                .authority(authority_from_host_port(&host, port))
+                .path_and_query(path_and_query);
+
+            Url::parse(&builder.build().unwrap().to_string()).unwrap()
+        })
+}
+
 /// Initializes the plugin.
 pub fn init<R: Runtime>(arg: Option<&'static str>) -> TauriPlugin<R> {
     let builder = Builder::new("tauri-plugin-module-federation")
@@ -63,42 +147,7 @@ pub fn init<R: Runtime>(arg: Option<&'static str>) -> TauriPlugin<R> {
 
                     let client = reqwest::Client::new();
                     let url = request.uri().clone();
-
-                    let url: Url = url
-                        .query()
-                        .and_then(|query| {
-                            let query_pairs: HashMap<_, _> =
-                                form_urlencoded::parse(query.as_bytes())
-                                    .into_iter()
-                                    .collect();
-
-                            query_pairs.get("fullUrl").map(|v| {
-                                let url = Url::parse(v).unwrap();
-
-                                let mut schemes = schemes.0.lock().unwrap();
-
-                                let key = (url.host().unwrap().to_string(), url.port());
-
-                                schemes.entry(key).or_insert(url.scheme().to_string());
-
-                                url
-                            })
-                        })
-                        .unwrap_or_else(|| {
-                            let url = url.clone();
-
-                            let host = url.host().unwrap().to_string();
-                            let schemes = schemes.0.lock().unwrap();
-                            let scheme = schemes
-                                .get(&(host.clone(), url.port().map(|p| p.as_u16())))
-                                .unwrap_or_else(|| {
-                                    dbg!(&schemes);
-                                    panic!("Unknown scheme for host '{host}:{:?}'", url.port())
-                                });
-
-                            let builder = uri::Builder::from(url).scheme(scheme.as_str());
-                            Url::parse(&builder.build().unwrap().to_string()).unwrap()
-                        });
+                    let url = resolve_remote_url(&url, schemes.inner());
 
                     let request_builder = client.request(request.method().clone(), url.clone());
 
@@ -186,4 +235,64 @@ pub fn init<R: Runtime>(arg: Option<&'static str>) -> TauriPlugin<R> {
             Ok(())
         })
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn schemes_with_remote() -> Schemes {
+        let schemes = Schemes::default();
+        schemes
+            .0
+            .lock()
+            .unwrap()
+            .insert(("localhost".to_string(), Some(3002)), "http".to_string());
+        schemes
+    }
+
+    #[test]
+    fn resolves_entry_from_full_url_query() {
+        let schemes = Schemes::default();
+        let uri = "module-federation://localhost:3002/remoteEntry.js?fullUrl=http%3A%2F%2Flocalhost%3A3002%2FremoteEntry.js"
+            .parse()
+            .unwrap();
+
+        let url = resolve_remote_url(&uri, &schemes);
+
+        assert_eq!(url.as_str(), "http://localhost:3002/remoteEntry.js");
+        assert_eq!(
+            schemes
+                .0
+                .lock()
+                .unwrap()
+                .get(&("localhost".to_string(), Some(3002)))
+                .map(String::as_str),
+            Some("http")
+        );
+    }
+
+    #[test]
+    fn resolves_relative_asset_from_custom_scheme_url() {
+        let schemes = schemes_with_remote();
+        let uri = "module-federation://localhost:3002/static/js/chunk.js?v=1"
+            .parse()
+            .unwrap();
+
+        let url = resolve_remote_url(&uri, &schemes);
+
+        assert_eq!(url.as_str(), "http://localhost:3002/static/js/chunk.js?v=1");
+    }
+
+    #[test]
+    fn resolves_relative_asset_from_windows_protocol_url() {
+        let schemes = schemes_with_remote();
+        let uri = "http://module-federation.localhost/localhost:3002/static/js/chunk.js?v=1"
+            .parse()
+            .unwrap();
+
+        let url = resolve_remote_url(&uri, &schemes);
+
+        assert_eq!(url.as_str(), "http://localhost:3002/static/js/chunk.js?v=1");
+    }
 }

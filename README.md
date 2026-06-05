@@ -46,7 +46,9 @@ tauri::Builder::default()
 
 ## Behavior
 
-- Remote entry URLs are rewritten from `http(s)://...` to `module-federation://.../?fullUrl=...`.
+- Remote entry URLs are rewritten from `http(s)://...` to a Tauri custom-protocol URL.
+- On macOS, iOS, and Linux, the runtime package uses `module-federation://...`.
+- On Windows and Android, Tauri serves custom protocols as `http://module-federation.localhost/...`, so the runtime package uses that URL shape instead.
 - The Tauri plugin fetches those assets over the network and stores them in the app cache dir.
 - Cache keys are derived from the remote host and request path.
 - If a later fetch fails, the cached asset is served instead.
